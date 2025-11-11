@@ -1,98 +1,95 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import sqlite3
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
+import os
 
-BOT_TOKEN = "8172728168:AAGf4IT93SBii_9mhg2KQMMR07llcDuYz1E"
+TOKEN = os.getenv("BOT_TOKEN")  # Токен берем из переменных окружения
+CHANNEL_ID = "@h1luat_stars"    # Канал, на который нужно быть подписанным
 
-# База данных
-conn = sqlite3.connect("referrals.db")
-cur = conn.cursor()
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    referred_by INTEGER,
-    referrals INTEGER DEFAULT 0
-)
-""")
-conn.commit()
-
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# --- Функция генерации клавиатуры ---
-def main_keyboard():
+# Хранилище рефералов
+referrals = {}
+
+
+# --- Проверка подписки ---
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in ["member", "administrator", "creator"]
+    except:
+        return False
+
+
+# --- Главное меню ---
+def main_menu():
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📎 Моя ссылка", callback_data="my_link")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")]
     ])
     return keyboard
 
-# --- /start ---
-@dp.message(Command("start"))
-async def start(message: types.Message):
+
+# --- Старт ---
+@dp.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+
+    # Проверяем, есть ли реферальная метка
     args = message.text.split()
-    referrer = None
-    if len(args) > 1 and args[1].isdigit():
-        referrer = int(args[1])
+    if len(args) > 1:
+        ref_id = args[1]
+        if ref_id != str(user_id):
+            referrals.setdefault(ref_id, set()).add(user_id)
 
-    cur.execute("SELECT * FROM users WHERE user_id = ?", (message.from_user.id,))
-    user = cur.fetchone()
+    # Проверка подписки
+    if not await is_subscribed(user_id):
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Подписаться на канал", url=f"https://t.me/{CHANNEL_ID[1:]}")],
+            [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_subscribe")]
+        ])
+        await message.answer(
+            "❌ Вы не подписаны на канал!\n"
+            "Подпишитесь на наш канал, чтобы использовать бота:",
+            reply_markup=keyboard
+        )
+        return
 
-    if not user:
-        cur.execute("INSERT INTO users (user_id, referred_by) VALUES (?, ?)", (message.from_user.id, referrer))
-        conn.commit()
+    await message.answer("✅ Добро пожаловать! Вы можете использовать бота:", reply_markup=main_menu())
 
-        if referrer:
-            cur.execute("UPDATE users SET referrals = referrals + 1 WHERE user_id = ?", (referrer,))
-            conn.commit()
-            try:
-                await bot.send_message(referrer, f"🎉 У тебя новый реферал: {message.from_user.full_name}")
-            except:
-                pass
 
-    await message.answer(
-        f"👋 Привет, {message.from_user.first_name}!\n\n"
-        f"Используй кнопки ниже 👇",
-        reply_markup=main_keyboard()
-    )
+# --- Проверка подписки по кнопке ---
+@dp.callback_query(F.data == "check_subscribe")
+async def check_subscribe(callback: types.CallbackQuery):
+    if await is_subscribed(callback.from_user.id):
+        await callback.message.edit_text("✅ Подписка подтверждена!", reply_markup=main_menu())
+    else:
+        await callback.answer("Вы всё ещё не подписаны 😢", show_alert=True)
 
-# --- Обработчик кнопки "Моя ссылка" ---
+
+# --- Моя ссылка ---
 @dp.callback_query(F.data == "my_link")
 async def send_ref_link(callback: types.CallbackQuery):
-    bot_user = await bot.get_me()
-    ref_link = f"https://t.me/{bot_user.username}?start={callback.from_user.id}"
-    await callback.message.answer(f"📎 Твоя реферальная ссылка:\n{ref_link}")
+    user_id = callback.from_user.id
+    ref_link = f"https://t.me/{(await bot.me()).username}?start={user_id}"
+    await callback.message.answer(f"📎 Ваша реферальная ссылка:\n{ref_link}")
 
-# --- Обработчик кнопки "Профиль" ---
+
+# --- Профиль ---
 @dp.callback_query(F.data == "profile")
-async def send_profile(callback: types.CallbackQuery):
-    cur.execute("SELECT referrals FROM users WHERE user_id = ?", (callback.from_user.id,))
-    row = cur.fetchone()
-    count = row[0] if row else 0
-    await callback.message.answer(
-        f"👤 Твой профиль:\n\n"
-        f"🆔 Telegram ID: `{callback.from_user.id}`\n"
-        f"👥 Количество рефералов: {count}",
-        parse_mode="Markdown"
-    )
+async def show_profile(callback: types.CallbackQuery):
+    user_id = str(callback.from_user.id)
+    refs = len(referrals.get(user_id, []))
+    await callback.message.answer(f"👤 Ваш ID: {user_id}\n👥 Приглашено рефералов: {refs}")
 
-# --- Команда /profile (если вводит вручную) ---
-@dp.message(Command("profile"))
-async def profile_command(message: types.Message):
-    cur.execute("SELECT referrals FROM users WHERE user_id = ?", (message.from_user.id,))
-    row = cur.fetchone()
-    count = row[0] if row else 0
-    await message.answer(
-        f"👤 Твой профиль:\n\n"
-        f"🆔 Telegram ID: `{message.from_user.id}`\n"
-        f"👥 Количество рефералов: {count}",
-        parse_mode="Markdown"
-    )
 
+# --- Запуск ---
 async def main():
+    print("Бот запущен 🚀")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
